@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useLocation, useParams } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowUp, BookOpenText, Check, ChevronDown, Hammer, Paperclip, Plus, Sparkles, X } from 'lucide-react'
+import { ArrowUp, BookOpenText, Check, ChevronDown, Hammer, Paperclip, Plus, X } from 'lucide-react'
 import { api, ApiError } from '../api/client'
 import { families, keys } from '../api/queries'
 import type {
   CreatedCheck,
+  NormPreview,
+  Normalization,
   DiscoverySession,
   Finding,
   Proposal,
@@ -29,6 +31,8 @@ import { TruthSources } from '../components/process/TruthSources'
 import { ValidationImpact } from '../components/process/ValidationImpact'
 import { Button, Input, Select, Textarea } from '../components/shell/Controls'
 import { ErrorNotice, Empty, EmptyState, Notice } from '../components/shell/Notice'
+import { TerminalLoader } from '../components/shell/TerminalLoader'
+import { NormProposal, type ProposalState } from '../components/process/NormProposal'
 import { ExpandableText } from '../components/shell/ExpandableText'
 import { NestedCard } from '../components/shell/Well'
 import { t } from '../i18n'
@@ -48,8 +52,12 @@ type Turn = {
   files: Attachment[]
   /** The chat's answer (discuss mode). */
   answer?: string
-  /** The checks a norm produced; each one is already a draft rule compiling. */
+  /** The rules an accepted proposal created; each one compiles in the background. */
   checks?: CreatedCheck[]
+  /** Normas: the norm this proposal reads, kept so a later message can revise it. */
+  norm?: string
+  preview?: NormPreview
+  state?: ProposalState
   /** Attachments that were not uploaded, because only Excel teaches a process. */
   skipped?: string[]
   error?: unknown
@@ -64,8 +72,8 @@ const PANE_CHAT = {
       'Si falta el pedido, se escala',
       'El NIF del emisor debe estar dado de alta',
     ],
-    placeholder: 'Pega una norma. Cada frase se vuelve una o varias reglas en borrador.',
-    proposals: 'Reglas creadas · se compilan solas',
+    placeholder: 'Pega una norma. Te propongo las reglas y tú decides.',
+    proposals: 'Propuesta',
   },
   contexto: {
     title: 'Pregunta sobre el proceso',
@@ -91,6 +99,9 @@ const PANE_CHAT = {
 } as const
 
 const EXCEL = /\.xlsx$/i
+
+const NORM_VERBS = ['leyendo la norma', 'buscando reglas que ya existen', 'separando comprobaciones', 'redactando la propuesta']
+const CHAT_VERBS = ['leyendo el proceso', 'buscando en las reglas', 'redactando la respuesta']
 
 /** The conversation for this process: the one still open, or a new one. */
 async function processConversation(processId: number, name: string): Promise<DiscoverySession> {
@@ -187,12 +198,33 @@ export function Definition() {
   const [viewing, setViewing] = useState<number | null>(null)
   const viewed = history.find((version) => version.id === viewing)
 
-  /** Normas: the normalizer. Anywhere else: the process chat, in discuss mode. */
+  // The proposal the next message revises, if one waits for the manager.
+  const openProposal =
+    pane === 'normas' ? turns.findLast((turn) => turn.preview && turn.state === 'open') : undefined
+
+  /**
+   * Normas: the normalizer proposes, nothing is created; a message while a proposal is
+   * open revises it. Anywhere else: the process chat, in discuss mode.
+   */
   const send = useMutation({
-    mutationFn: async ({ prompt, files }: { prompt: string; files: Attachment[] }) => {
+    mutationFn: async ({
+      prompt,
+      files,
+      revising,
+    }: {
+      prompt: string
+      files: Attachment[]
+      revising?: Turn
+    }): Promise<Partial<Turn>> => {
       if (pane === 'normas') {
-        const out = await api.normalizeNorm(processId, prompt)
-        return { checks: out.norm_rules.flatMap((item) => item.checks) }
+        const norm = revising?.norm ?? prompt
+        const preview = await api.previewNorm(
+          processId,
+          revising?.preview
+            ? { text: norm, feedback: prompt, previous: { norm_rules: revising.preview.norm_rules } }
+            : { text: prompt },
+        )
+        return { preview, norm, state: 'open' }
       }
       if (!session.current) {
         session.current = await processConversation(processId, process.data?.name ?? 'Definición')
@@ -218,11 +250,16 @@ export function Definition() {
       setTurns((current) => [...current, { id, prompt, files }])
       return { id }
     },
-    onSuccess: (result, _vars, context) => {
+    onSuccess: (result, { revising }, context) => {
       setTurns((current) =>
-        current.map((turn) => (turn.id === context?.id ? { ...turn, ...result } : turn)),
+        current.map((turn) =>
+          turn.id === context?.id
+            ? { ...turn, ...result }
+            : turn.id === revising?.id
+              ? { ...turn, state: 'revised' }
+              : turn,
+        ),
       )
-      if ('checks' in result) void queryClient.invalidateQueries({ queryKey: ['rules'] })
     },
     onError: (error, _vars, context) => {
       // A stale revision: start from the conversation's current one next time.
@@ -230,6 +267,23 @@ export function Definition() {
       setTurns((current) =>
         current.map((turn) => (turn.id === context?.id ? { ...turn, error } : turn)),
       )
+    },
+  })
+
+  const settleTurn = (id: string, change: Partial<Turn>) =>
+    setTurns((current) => current.map((turn) => (turn.id === id ? { ...turn, ...change } : turn)))
+
+  // Only now do rules exist: the reviewed proposal is created and compiles.
+  const accept = useMutation({
+    mutationFn: ({ reviewed }: { turnId: string; reviewed: Normalization }) =>
+      api.acceptNorm(processId, reviewed),
+    onSuccess: (out, { turnId }) => {
+      settleTurn(turnId, {
+        state: 'accepted',
+        checks: out.norm_rules.flatMap((item) => item.checks),
+      })
+      void queryClient.invalidateQueries({ queryKey: ['rules'] })
+      void queryClient.invalidateQueries({ queryKey: keys.norm(processId) })
     },
   })
 
@@ -250,11 +304,10 @@ export function Definition() {
               <ol className="space-y-6">
                 {inbox.length > 0 ? (
                   <li className="space-y-3">
-                    <div className="flex items-center gap-1.5 text-[12px] text-muted">
-                      <Sparkles size={13} strokeWidth={1.6} />
+                    <p className="text-[12px] text-muted">
                       {inbox.length} propuesta{inbox.length === 1 ? '' : 's'} esperan tu decisión ·
                       aceptar entra al borrador
-                    </div>
+                    </p>
                     <ul className="space-y-2">
                       {inbox.map((proposal) => (
                         <ProposalCard key={proposal.id} processId={processId} proposal={proposal} />
@@ -276,12 +329,13 @@ export function Definition() {
                         </ul>
                       ) : null}
                     </div>
-                    <div className="flex items-center gap-1.5 text-[12px] text-muted">
-                      <Sparkles size={13} strokeWidth={1.6} />
-                      {turn.answer === undefined && !turn.checks && !turn.error
-                        ? 'Pensando…'
-                        : chat.proposals}
-                    </div>
+                    {turn.answer === undefined && !turn.preview && !turn.checks && !turn.error ? (
+                      <TerminalLoader verbs={pane === 'normas' ? NORM_VERBS : CHAT_VERBS} />
+                    ) : (
+                      <p className="font-mono text-[11px] tracking-[0.08em] text-faint">
+                        {chat.proposals.toUpperCase()}
+                      </p>
+                    )}
                     {turn.skipped?.length ? (
                       <Notice tone="warning" title="Solo Excel">
                         No se han subido: {turn.skipped.join(', ')}
@@ -294,6 +348,17 @@ export function Definition() {
                           {turn.answer}
                         </p>
                       </div>
+                    ) : null}
+                    {turn.preview && turn.state ? (
+                      <NormProposal
+                        processId={processId}
+                        preview={turn.preview}
+                        state={turn.state}
+                        accepting={accept.isPending && accept.variables?.turnId === turn.id}
+                        error={accept.variables?.turnId === turn.id ? accept.error : undefined}
+                        onAccept={(reviewed) => accept.mutate({ turnId: turn.id, reviewed })}
+                        onDiscard={() => settleTurn(turn.id, { state: 'discarded' })}
+                      />
                     ) : null}
                     {turn.checks ? (
                       <ul className="space-y-2">
@@ -336,13 +401,15 @@ export function Definition() {
           ) : null}
 
           <Composer
-            placeholder={chat.placeholder}
+            placeholder={
+              openProposal ? 'Pide cambios a la propuesta: «quita la del IBAN», «que escale»…' : chat.placeholder
+            }
             draft={draft}
             onDraft={setDraft}
             focusTick={focusTick}
             busy={send.isPending}
             onSend={(text, files) => {
-              send.mutate({ prompt: text, files })
+              send.mutate({ prompt: text, files, revising: openProposal })
               setDraft('')
             }}
           />
