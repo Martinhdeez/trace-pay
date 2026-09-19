@@ -18,6 +18,8 @@ import type {
   InstanceTrace,
   LoadResult,
   NormOut,
+  Normalization,
+  NormPreview,
   NormRule,
   PlaneHealth,
   ProcessDetail,
@@ -66,6 +68,10 @@ export const liveClient: ApiClient = {
     get<Rule[]>(`/processes/${processId}/rules${query({ status })}`),
   listNormRules: (processId) => get<NormRule[]>(`/processes/${processId}/norm-rules`),
   normalizeNorm: (processId, text) => post<NormOut>(`/processes/${processId}/norm`, { text }),
+  previewNorm: (processId, body) =>
+    post<NormPreview>(`/processes/${processId}/norm/preview`, body),
+  acceptNorm: (processId, body: Normalization) =>
+    post<NormOut>(`/processes/${processId}/norm/accept`, body),
   getRule: (id) => get<RuleDetail>(`/rules/${id}`),
   createRule: (processId, body) => post<RuleDetail>(`/processes/${processId}/rules`, body),
   compileRule: (id) => post<RuleDetail>(`/rules/${id}/compile`),

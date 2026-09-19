@@ -3310,6 +3310,150 @@
         }
       }
     },
+    "/processes/{process_id}/norm/preview": {
+      "post": {
+        "tags": [
+          "rules"
+        ],
+        "summary": "What the normalizer makes of a norm, without saving anything",
+        "description": "Same reading as `POST /norm`, returned for review: nothing is written. With `previous` (an earlier preview) and `feedback` the normalizer revises that proposal. `existing` holds the rules that the sentences' `covered` ids name, whatever their status: what the norm asks for that is already there. `POST /norm/accept` saves the reviewed one.",
+        "operationId": "previewNorm",
+        "parameters": [
+          {
+            "name": "process_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Process Id"
+            }
+          },
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NormPreviewIn"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NormPreview"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The normalizer's model failed"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/processes/{process_id}/norm/accept": {
+      "post": {
+        "tags": [
+          "rules"
+        ],
+        "summary": "Save a reviewed norm preview: its checks become rules that compile in the background (status `compiling`)",
+        "description": "The body is a preview's `norm_rules`, possibly with checks or sentences removed. 409 when a check decides a decision type that does not exist or is the default, or says exactly what an existing rule says.",
+        "operationId": "acceptNorm",
+        "parameters": [
+          {
+            "name": "process_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Process Id"
+            }
+          },
+          {
+            "name": "x-user-id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-User-Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Normalization"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NormOut"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A check is invalid or already exists"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/processes/{process_id}/norm-rules": {
       "get": {
         "tags": [
@@ -9041,6 +9185,72 @@
         ],
         "title": "ChangeOut"
       },
+      "Check": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "summary": {
+            "type": "string",
+            "title": "Summary",
+            "default": ""
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "requirement",
+              "prohibition"
+            ],
+            "title": "Type"
+          },
+          "decision": {
+            "type": "string",
+            "title": "Decision"
+          },
+          "decision_source": {
+            "type": "string",
+            "enum": [
+              "explicit",
+              "policy"
+            ],
+            "title": "Decision Source"
+          },
+          "quote": {
+            "type": "string",
+            "title": "Quote",
+            "default": ""
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "violation",
+              "doubt"
+            ],
+            "title": "Kind",
+            "default": "violation"
+          },
+          "kind_reason": {
+            "type": "string",
+            "title": "Kind Reason",
+            "default": ""
+          },
+          "interpretation": {
+            "type": "string",
+            "title": "Interpretation"
+          }
+        },
+        "type": "object",
+        "required": [
+          "text",
+          "type",
+          "decision",
+          "decision_source",
+          "interpretation"
+        ],
+        "title": "Check",
+        "description": "One checkable condition of a norm sentence: becomes one `Rule`."
+      },
       "CheckOut": {
         "properties": {
           "id": {
@@ -11220,6 +11430,47 @@
         ],
         "title": "ExecutionSettings"
       },
+      "ExistingRule": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Summary"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "decision": {
+            "type": "string",
+            "title": "Decision"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "text",
+          "summary",
+          "status",
+          "decision"
+        ],
+        "title": "ExistingRule",
+        "description": "A rule a sentence's `covered` names: what already implements part of it."
+      },
       "ExtractOptions": {
         "properties": {
           "mode": {
@@ -12970,6 +13221,58 @@
         ],
         "title": "NormOut"
       },
+      "NormPreview": {
+        "properties": {
+          "norm_rules": {
+            "items": {
+              "$ref": "#/components/schemas/Sentence"
+            },
+            "type": "array",
+            "title": "Norm Rules"
+          },
+          "existing": {
+            "items": {
+              "$ref": "#/components/schemas/ExistingRule"
+            },
+            "type": "array",
+            "title": "Existing",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "norm_rules"
+        ],
+        "title": "NormPreview"
+      },
+      "NormPreviewIn": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "feedback": {
+            "type": "string",
+            "title": "Feedback",
+            "default": ""
+          },
+          "previous": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Normalization"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "title": "NormPreviewIn"
+      },
       "NormRuleOut": {
         "properties": {
           "id": {
@@ -13083,6 +13386,22 @@
         ],
         "title": "NormStats",
         "description": "One norm submitted: what its agents spent, and when its rules went live."
+      },
+      "Normalization": {
+        "properties": {
+          "norm_rules": {
+            "items": {
+              "$ref": "#/components/schemas/Sentence"
+            },
+            "type": "array",
+            "title": "Norm Rules"
+          }
+        },
+        "type": "object",
+        "required": [
+          "norm_rules"
+        ],
+        "title": "Normalization"
       },
       "Option": {
         "properties": {
@@ -15274,6 +15593,49 @@
           "by_decision"
         ],
         "title": "RunSummary"
+      },
+      "Sentence": {
+        "properties": {
+          "number": {
+            "type": "integer",
+            "title": "Number"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "checks": {
+            "items": {
+              "$ref": "#/components/schemas/Check"
+            },
+            "type": "array",
+            "title": "Checks",
+            "default": []
+          },
+          "policies": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Policies",
+            "default": []
+          },
+          "covered": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Covered",
+            "default": []
+          }
+        },
+        "type": "object",
+        "required": [
+          "number",
+          "text"
+        ],
+        "title": "Sentence",
+        "description": "One sentence of the norm and what the normalizer made of it."
       },
       "SettleIn": {
         "properties": {

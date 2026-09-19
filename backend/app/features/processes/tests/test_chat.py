@@ -311,7 +311,7 @@ async def test_norm_ingestion_reads_chat_published_schema_and_conventions(
     await post(api, await post(api, await accept(api, draft), "prepare"), "publish")
     calls = []
 
-    async def normalize(norm, description, types, symbols, sources, active, setup):
+    async def normalize(norm, description, types, symbols, sources, active, setup, **_):
         calls.append((description, {t.name for t in types}, {s.name for s in symbols}))
         return normalizer.Normalization(norm_rules=[]), None
 

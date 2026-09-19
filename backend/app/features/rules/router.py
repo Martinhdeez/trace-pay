@@ -5,7 +5,13 @@ from fastapi import APIRouter, BackgroundTasks, status
 from app.core import events
 from app.core.database import Session
 from app.features.agents import normalizer
-from app.features.agents.normalizer import NormIn, NormOut
+from app.features.agents.normalizer import (
+    Normalization,
+    NormIn,
+    NormOut,
+    NormPreview,
+    NormPreviewIn,
+)
 from app.features.decisions.schemas import ImpactOut
 from app.features.rules import service
 from app.features.rules.schemas import NormRuleOut, RuleDetail, RuleIn, RuleOut
@@ -66,6 +72,50 @@ async def normalize_norm(
     # One trace: the normalizer, then every check's compilation in the background.
     with events.span("norm", process_id=process_id, author=user.name) as span:
         out = await normalizer.normalize_norm(session, process_id, body.text)
+    ids = [c.rule_id for n in out.norm_rules for c in n.checks]
+    background.add_task(service.compile_all_in_background, ids, span)
+    return out
+
+
+@router.post(
+    "/processes/{process_id}/norm/preview",
+    operation_id="previewNorm",
+    summary="What the normalizer makes of a norm, without saving anything",
+    description="Same reading as `POST /norm`, returned for review: nothing is written. With "
+    "`previous` (an earlier preview) and `feedback` the normalizer revises that proposal. "
+    "`existing` holds the rules that the sentences' `covered` ids name, whatever their status: "
+    "what the norm asks for that is already there. `POST /norm/accept` saves the reviewed one.",
+    responses={502: {"description": "The normalizer's model failed"}},
+)
+async def preview_norm(
+    process_id: int, body: NormPreviewIn, session: Session, user: Manager
+) -> NormPreview:
+    with events.span("norm_preview", process_id=process_id, author=user.name):
+        return await normalizer.preview(
+            session, process_id, body.text, body.feedback, body.previous
+        )
+
+
+@router.post(
+    "/processes/{process_id}/norm/accept",
+    operation_id="acceptNorm",
+    status_code=status.HTTP_201_CREATED,
+    summary="Save a reviewed norm preview: its checks become rules that compile in the "
+    "background (status `compiling`)",
+    description="The body is a preview's `norm_rules`, possibly with checks or sentences "
+    "removed. 409 when a check decides a decision type that does not exist or is the default, "
+    "or says exactly what an existing rule says.",
+    responses={409: {"description": "A check is invalid or already exists"}},
+)
+async def accept_norm(
+    process_id: int,
+    body: Normalization,
+    session: Session,
+    user: Manager,
+    background: BackgroundTasks,
+) -> NormOut:
+    with events.span("norm", process_id=process_id, author=user.name) as span:
+        out = await normalizer.persist(session, process_id, body)
     ids = [c.rule_id for n in out.norm_rules for c in n.checks]
     background.add_task(service.compile_all_in_background, ids, span)
     return out

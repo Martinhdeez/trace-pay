@@ -146,6 +146,14 @@ export type Rule = Schemas['RuleOut']
 export type RuleDetail = Schemas['RuleDetail']
 export type NormRule = Schemas['NormRuleOut']
 export type NormOut = Schemas['NormOut']
+/** A norm as the normalizer read it, before anything is saved: reviewed, then accepted. */
+export type Normalization = Schemas['Normalization']
+export type NormSentence = Schemas['Sentence']
+export type NormPreview = Schemas['NormPreview']
+/** `feedback` and `previous` only when revising an earlier preview. */
+export type NormPreviewIn = Omit<Schemas['NormPreviewIn'], 'feedback'> & { feedback?: string }
+/** A rule a sentence's `covered` names: what the norm asks for that already exists. */
+export type ExistingRule = Schemas['ExistingRule']
 export type CreatedCheck = Schemas['CreatedCheck']
 /** What adding, or removing, a rule would do to the decisions already taken. */
 export type Impact = Schemas['ImpactOut']
@@ -207,6 +215,10 @@ export interface ApiClient {
   listNormRules(processId: number): Promise<NormRule[]>
   /** Splits a norm into checks, each already created as a draft rule that compiles. */
   normalizeNorm(processId: number, text: string): Promise<NormOut>
+  /** What the normalizer makes of a norm, revised with `feedback`. Saves nothing. */
+  previewNorm(processId: number, body: NormPreviewIn): Promise<NormPreview>
+  /** Saves a reviewed preview: its checks become draft rules that compile. */
+  acceptNorm(processId: number, body: Normalization): Promise<NormOut>
   getRule(id: number): Promise<RuleDetail>
   createRule(processId: number, body: RuleIn): Promise<RuleDetail>
   compileRule(id: number): Promise<RuleDetail>

@@ -98,6 +98,7 @@ PLANES: dict[str, Plane] = {
     "activate_agent_config": _AGENTS,
     "save_rule": _AGENTS,
     "norm": _AGENTS,
+    "norm_preview": _AGENTS,
     "normalize_norm": _AGENTS,
     "discover_process": _AGENTS,
     "discuss_process": _AGENTS,

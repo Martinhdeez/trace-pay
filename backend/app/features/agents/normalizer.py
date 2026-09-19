@@ -3,9 +3,10 @@
 A non-technical person pastes the norm (any language). Each sentence stays one norm rule,
 kept exactly as written: the unit the client owns. The normalizer splits it into atomic
 checks, in English, each with the decision the norm implies and how it was read; each check
-is an ordinary `Rule` (one code, one decision) linked to its norm rule. Nobody reviews it:
-the checks are saved like any other rule and compile in the background (ADR 0004), and
-every interpretation is kept in the check's `report["norm"]`.
+is an ordinary `Rule` (one code, one decision) linked to its norm rule. The console first
+asks for a preview, which writes nothing and can be revised with the manager's feedback;
+accepting it saves the checks like any other rule, they compile in the background (ADR
+0004), and every interpretation is kept in the check's `report["norm"]`.
 
 A check's decision is the one the norm names for that failure (`decision_source:
 "explicit"`, with the words that name it). When the norm does not name it (`"policy"`),
@@ -71,6 +72,26 @@ class NormIn(BaseModel):
     text: str
 
 
+class NormPreviewIn(BaseModel):
+    text: str
+    feedback: str = ""  # the manager's answer to `previous`, to revise it
+    previous: Normalization | None = None
+
+
+class ExistingRule(BaseModel):
+    """A rule a sentence's `covered` names: what already implements part of it."""
+
+    id: int
+    text: str
+    summary: str | None
+    status: str
+    decision: str
+
+
+class NormPreview(Normalization):
+    existing: list[ExistingRule] = []
+
+
 class CreatedCheck(Check):
     rule_id: int
 
@@ -88,7 +109,7 @@ class NormOut(BaseModel):
 class Deps:
     decisions: set[str]
     default: str
-    rules: dict[int, str]  # existing active rules: id -> text
+    rules: dict[int, str]  # existing rules, any status but retired: id -> text
     policy: str | None = None  # failed_check_decision: decides every `policy` violation
     escalate: str | None = None  # the escalation type: decides every `policy` doubt
 
@@ -126,7 +147,7 @@ def _consistent(ctx: RunContext[Deps], output: Normalization) -> Normalization:
     if len(set(texts)) < len(texts):
         problems.append("check texts must be unique")
     if repeated := set(texts) & {t.strip() for t in ctx.deps.rules.values()}:
-        problems.append(f"already active rules, list their ids in `covered`: {sorted(repeated)}")
+        problems.append(f"already existing rules, list their ids in `covered`: {sorted(repeated)}")
     if unknown := {i for s in output.norm_rules for i in s.covered} - set(ctx.deps.rules):
         problems.append(f"`covered` names rules that do not exist: {sorted(unknown)}")
     if empty := [s.number for s in output.norm_rules if not (s.checks or s.policies or s.covered)]:
@@ -173,8 +194,11 @@ def context(
     sources: compiler.Sources,
     active: Sequence[Rule],
     policy: str | None = None,
+    previous: Normalization | None = None,
+    feedback: str = "",
 ) -> str:
-    """What the normalizer sees: the norm and everything a rule may use or already says."""
+    """What the normalizer sees: the norm and everything a rule may use or already says.
+    `active` is every rule that is not retired, whatever its status."""
     lines = [
         "Norm:",
         norm.strip(),
@@ -196,12 +220,18 @@ def context(
         lines += [f"    {json.dumps(r, ensure_ascii=False, default=str)}" for r in rows[:3]]
     if not sources:
         lines.append("- (none)")
-    lines += ["", "Active rules (id: text):"]
-    lines += [f"- {r.id}: {r.text}" for r in active] or ["- (none)"]
+    lines += ["", "Existing rules (id (status): text):"]
+    lines += [f"- {r.id}{f' ({r.status})' if r.status else ''}: {r.text}" for r in active] or [
+        "- (none)"
+    ]
     lines += ["", "Decision of a `policy` check of kind `violation`:"]
     lines.append(f"- {policy}" if policy else "- (not set: follow the fallbacks)")
     lines += ["", "Decision of a `policy` check of kind `doubt`:"]
     lines.append(f"- {escalation(types) or '(no type requires a human: follow the fallbacks)'}")
+    if previous is not None:
+        lines += ["", "Your previous proposal (JSON):", previous.model_dump_json()]
+    if feedback.strip():
+        lines += ["", "The manager's feedback on it:", feedback.strip()]
     return "\n".join(lines)
 
 
@@ -213,6 +243,8 @@ async def normalize(
     sources: compiler.Sources,
     active: Sequence[Rule],
     setup: llm.Setup | None = None,
+    previous: Normalization | None = None,
+    feedback: str = "",
 ) -> tuple[Normalization, llm.Trace]:
     """The normalizer on one norm, without the database."""
     policy = setup.settings.failed_check_decision if setup else None
@@ -224,7 +256,7 @@ async def normalize(
         policy=policy,
         escalate=escalation(types),
     )
-    prompt = context(norm, description, types, symbols, sources, active, policy)
+    prompt = context(norm, description, types, symbols, sources, active, policy, previous, feedback)
     return await llm.run(
         normalizer,
         "normalizer",
@@ -235,38 +267,99 @@ async def normalize(
     )
 
 
-async def normalize_norm(session: AsyncSession, process_id: int, norm: str) -> NormOut:
-    """Normalize a norm: one norm rule per sentence, each check a `Rule` linked to it,
-    with the normalizer's reading in `report["norm"]`."""
+async def _definition(session: AsyncSession, process_id: int):
+    """Decision types and symbols as the draft has them, else as published."""
     if await session.get(Process, process_id) is None:
         raise NotFoundError(f"Process {process_id} does not exist")
-    description, sources, setups = await compiler.read_process(session, process_id)
     from app.features.processes import service as processes
-
-    process = await processes.get(session, process_id)
-    types = [DecisionType(**t.model_dump()) for t in process.decision_types]
-    symbols = [Symbol(**s.model_dump()) for s in process.symbols]
     from app.features.versions.model import ProcessDraft
 
     draft = await session.get(ProcessDraft, process_id)
     if draft:
         types = [DecisionType(**t) for t in draft.snapshot["process"]["decision_types"]]
         symbols = [Symbol(**s) for s in draft.snapshot["process"]["symbols"]]
-    active = list(
+        return types, symbols
+    process = await processes.get(session, process_id)
+    types = [DecisionType(**t.model_dump()) for t in process.decision_types]
+    symbols = [Symbol(**s.model_dump()) for s in process.symbols]
+    return types, symbols
+
+
+async def _existing(session: AsyncSession, process_id: int) -> list[Rule]:
+    """Every rule that is not retired: a draft or compiling rule is not written twice either."""
+    return list(
         await session.scalars(
             select(Rule)
-            .where(Rule.process_id == process_id, Rule.status == "active")
+            .where(Rule.process_id == process_id, Rule.status != "retired")
             .order_by(Rule.id)
         )
     )
+
+
+async def preview(
+    session: AsyncSession,
+    process_id: int,
+    norm: str,
+    feedback: str = "",
+    previous: Normalization | None = None,
+) -> NormPreview:
+    """What the normalizer makes of a norm, revised with the manager's feedback when given.
+    Writes nothing: `persist` saves what the manager accepts."""
+    types, symbols = await _definition(session, process_id)
+    description, sources, setups = await compiler.read_process(session, process_id)
+    existing = await _existing(session, process_id)
     with events.span("normalize_norm", process_id=process_id) as span:
         output, _ = await normalize(
-            norm, description, types, symbols, sources, active, setups.get("normalizer")
+            norm,
+            description,
+            types,
+            symbols,
+            sources,
+            existing,
+            setups.get("normalizer"),
+            previous=previous,
+            feedback=feedback,
         )
         checks = sum(len(s.checks) for s in output.norm_rules)
         span.set(output=output.model_dump(), norm_rules=len(output.norm_rules), checks=checks)
+    covered = {i for s in output.norm_rules for i in s.covered}
+    return NormPreview(
+        norm_rules=output.norm_rules,
+        existing=[
+            ExistingRule(
+                id=r.id, text=r.text, summary=r.summary, status=r.status, decision=r.decision
+            )
+            for r in existing
+            if r.id in covered
+        ],
+    )
+
+
+async def persist(session: AsyncSession, process_id: int, output: Normalization) -> NormOut:
+    """Save a reviewed normalization: one norm rule per sentence that keeps a check or a
+    policy, each check a `Rule` linked to it, with its reading in `report["norm"]`. The
+    manager may have dropped checks, so what the model validator checked is checked again."""
+    types, _ = await _definition(session, process_id)
+    names = {t.name for t in types}
+    default = next((t.name for t in types if t.is_default), None)
+    taken = {r.text.strip() for r in await _existing(session, process_id)}
+    texts = [c.text.strip() for s in output.norm_rules for c in s.checks]
+    problems = []
+    for c in (c for s in output.norm_rules for c in s.checks):
+        if c.decision not in names:
+            problems.append(f"{c.decision!r} is not a decision type ({sorted(names)})")
+        elif c.decision == default:
+            problems.append(f"check {c.text!r} decides the default {c.decision!r}")
+    if len(set(texts)) < len(texts):
+        problems.append("check texts must be unique")
+    if repeated := set(texts) & taken:
+        problems.append(f"these checks already exist as rules: {sorted(repeated)}")
+    if problems:
+        raise ConflictError("; ".join(problems))
     created = []
     for sentence in output.norm_rules:
+        if not (sentence.checks or sentence.policies):
+            continue
         norm_rule = NormRule(
             process_id=process_id,
             number=sentence.number,
@@ -304,3 +397,9 @@ async def normalize_norm(session: AsyncSession, process_id: int, norm: str) -> N
         )
     await session.commit()
     return NormOut(norm_rules=created)
+
+
+async def normalize_norm(session: AsyncSession, process_id: int, norm: str) -> NormOut:
+    """Normalize a norm and save it as is, without review (the CLI, evals and tests)."""
+    proposal = await preview(session, process_id, norm)
+    return await persist(session, process_id, Normalization(norm_rules=proposal.norm_rules))

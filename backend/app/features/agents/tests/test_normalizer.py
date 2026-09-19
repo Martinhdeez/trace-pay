@@ -79,13 +79,37 @@ async def test_sees_the_whole_context(monkeypatch) -> None:
     assert "suppliers: columns ['nif', 'iban']" in prompt
 
 
+async def test_a_revision_sees_its_previous_proposal_and_the_feedback(monkeypatch) -> None:
+    seen: dict = {}
+    monkeypatch.setattr(llm, "model_for", per_role({"normalizer": [answer()]}, seen))
+    previous = normalizer.Normalization.model_validate(answer())
+    draft = Rule(id=8, text="`iban` is a valid IBAN.", status="draft")
+
+    await normalizer.normalize(
+        NORM,
+        "Conventions",
+        TYPES,
+        SYMBOLS,
+        SOURCES,
+        [*ACTIVE, draft],
+        llm.Setup(AgentSettings()),
+        previous=previous,
+        feedback="Escala en lugar de rechazar.",
+    )
+
+    prompt = user_prompt(seen["normalizer"][0])
+    assert "- 8 (draft): `iban` is a valid IBAN." in prompt
+    assert "Your previous proposal (JSON):" in prompt and CHECK["text"] in prompt
+    assert "Escala en lugar de rechazar." in prompt
+
+
 @pytest.mark.parametrize(
     ("bad", "complaint"),
     [
         (answer([{**CHECK, "decision": "REJECT"}]), "'REJECT' is not a decision type"),
         (answer([{**CHECK, "decision": "PAGAR"}]), "decides the default 'PAGAR'"),
         (answer([CHECK, {**CHECK, "decision": "ESCALAR"}]), "check texts must be unique"),
-        (answer([{**CHECK, "text": "`iban` is not empty."}]), "already active rules"),
+        (answer([{**CHECK, "text": "`iban` is not empty."}]), "already existing rules"),
         (answer(covered=[99]), "names rules that do not exist: [99]"),
         ({"norm_rules": [{"number": 1, "text": "x"}]}, "have no check"),
         (answer([{**CHECK, "decision_source": "explicit", "quote": "no pagar"}]), "is `explicit`"),
@@ -190,6 +214,22 @@ async def api():
     await engine.dispose()  # connections are bound to this test's event loop
 
 
+async def scripted_draft(process_id: int) -> None:
+    """The draft predates the test's scripted models: let them answer."""
+    from copy import deepcopy
+
+    from app.features.versions.model import ProcessDraft
+
+    async with session_factory() as session:
+        draft = await session.get(ProcessDraft, process_id)
+        if draft:
+            snapshot = deepcopy(draft.snapshot)
+            for agent in snapshot["agents"].values():
+                agent["settings"]["model"] = None
+            draft.snapshot = snapshot
+            await session.commit()
+
+
 CODE = """
 def evaluate(instance, sources, others):
     return {"fires": not instance.get("iban"), "reason": "NO_IBAN"}
@@ -224,19 +264,7 @@ async def test_the_norm_becomes_norm_rules_whose_checks_compile(api, monkeypatch
     }
     models = per_role(scripts)
     monkeypatch.setattr(llm, "model_for", models)
-    # The draft predates this test's scripted model setup.
-    from copy import deepcopy
-
-    from app.features.versions.model import ProcessDraft
-
-    async with session_factory() as session:
-        draft = await session.get(ProcessDraft, process_id)
-        if draft:
-            snapshot = deepcopy(draft.snapshot)
-            for agent in snapshot["agents"].values():
-                agent["settings"]["model"] = None
-            draft.snapshot = snapshot
-            await session.commit()
+    await scripted_draft(process_id)
 
     r = await client.post(
         f"/processes/{process_id}/norm", json={"text": NORM}, headers=headers["manager"]
@@ -321,3 +349,89 @@ async def test_an_operator_cannot_change_the_norm(api, monkeypatch) -> None:
 
     assert r.status_code == 403, r.text
     assert (await client.get(f"/processes/{process_id}/norm-rules")).json() == []
+
+
+@needs_db
+async def test_a_preview_saves_nothing_and_accepting_it_does(api, monkeypatch) -> None:
+    client, process_id, headers = api
+    compiled: list[int] = []
+
+    async def compile_all(ids, parent=None) -> None:
+        compiled.extend(ids)
+
+    monkeypatch.setattr(rules_service, "compile_all_in_background", compile_all)
+    r = await client.post(
+        f"/processes/{process_id}/rules",
+        json={"text": "`iban` is not empty.", "type": "requirement", "decision": "ESCALAR"},
+        headers=headers["manager"],
+    )
+    existing = r.json()["id"]
+    reply = answer(covered=[existing])
+    monkeypatch.setattr(llm, "model_for", per_role({"normalizer": [reply]}))
+    await scripted_draft(process_id)
+
+    r = await client.post(
+        f"/processes/{process_id}/norm/preview", json={"text": NORM}, headers=headers["manager"]
+    )
+
+    assert r.status_code == 200, r.text
+    proposal = r.json()
+    assert [e["id"] for e in proposal["existing"]] == [existing]
+    assert proposal["existing"][0]["status"] in {"compiling", "draft", "blocked"}
+    assert (await client.get(f"/processes/{process_id}/norm-rules")).json() == []
+    assert len((await client.get(f"/processes/{process_id}/rules")).json()) == 1
+
+    body = {"norm_rules": proposal["norm_rules"]}
+    r = await client.post(
+        f"/processes/{process_id}/norm/accept", json=body, headers=headers["manager"]
+    )
+
+    assert r.status_code == 201, r.text
+    [sentence] = r.json()["norm_rules"]
+    rule_id = sentence["checks"][0]["rule_id"]
+    assert compiled[-1:] == [rule_id]
+    rule = (await client.get(f"/rules/{rule_id}")).json()
+    assert rule["norm_rule_id"] == sentence["id"]
+    assert rule["report"]["norm"]["covered"] == [existing]
+
+
+@needs_db
+@pytest.mark.parametrize(
+    ("check", "complaint"),
+    [
+        ({**CHECK, "decision": "PAGAR"}, "decides the default"),
+        ({**CHECK, "decision": "REJECT"}, "is not a decision type"),
+        ({**CHECK, "text": "`iban` is not empty."}, "already exist as rules"),
+    ],
+)
+async def test_accepting_an_invalid_check_saves_nothing(
+    api, monkeypatch, check: dict, complaint: str
+) -> None:
+    client, process_id, headers = api
+    monkeypatch.setattr(rules_service, "compile_all_in_background", lambda *_, **__: None)
+    await client.post(
+        f"/processes/{process_id}/rules",
+        json={"text": "`iban` is not empty.", "type": "requirement", "decision": "ESCALAR"},
+        headers=headers["manager"],
+    )
+
+    r = await client.post(
+        f"/processes/{process_id}/norm/accept",
+        json=answer([check]),
+        headers=headers["manager"],
+    )
+
+    assert r.status_code == 409, r.text
+    assert complaint in r.text
+    assert (await client.get(f"/processes/{process_id}/norm-rules")).json() == []
+
+
+@needs_db
+async def test_an_operator_cannot_preview_or_accept(api, monkeypatch) -> None:
+    client, process_id, headers = api
+    monkeypatch.setattr(llm, "model_for", per_role({"normalizer": []}))
+    for path, body in (("preview", {"text": NORM}), ("accept", answer())):
+        r = await client.post(
+            f"/processes/{process_id}/norm/{path}", json=body, headers=headers["operator"]
+        )
+        assert r.status_code == 403, r.text
